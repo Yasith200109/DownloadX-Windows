@@ -13,6 +13,7 @@
 //! split can never cut into bytes that are being written.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub type WorkerId = u32;
 
@@ -83,6 +84,8 @@ pub struct Planner {
     preempt_after: std::time::Duration,
     /// Sorted by `start`, contiguous, covering `[0, size)`.
     segs: Vec<Segment>,
+    /// Workers asked to retire after finishing and committing their current segment.
+    retire: HashSet<WorkerId>,
 }
 
 impl Planner {
@@ -98,6 +101,7 @@ impl Planner {
             min_split: min_split.max(1),
             preempt_after: std::time::Duration::ZERO,
             segs,
+            retire: HashSet::new(),
         }
     }
 
@@ -136,6 +140,7 @@ impl Planner {
             min_split: min_split.max(1),
             preempt_after: std::time::Duration::ZERO,
             segs,
+            retire: HashSet::new(),
         })
     }
 
@@ -177,6 +182,27 @@ impl Planner {
             .iter()
             .filter(|s| s.worker.is_some() && s.receiving)
             .count()
+    }
+
+    /// Ask a worker to retire cooperatively. The worker must only consume this request at the
+    /// top of its work loop: after its current segment has been fully committed or released.
+    /// Worker IDs are monotonic and must not be reused.
+    pub fn request_retirement(&mut self, w: WorkerId) {
+        self.retire.insert(w);
+    }
+
+    /// Consume a retirement request only when the worker owns no segment. This guard makes it
+    /// impossible to retire a worker while it still has claimed or uncommitted bytes.
+    pub fn take_retirement(&mut self, w: WorkerId) -> bool {
+        if self.holds(w) {
+            return false;
+        }
+        self.retire.remove(&w)
+    }
+
+    /// Cancel a pending retirement if a newer controller observation raises the target again.
+    pub fn cancel_retirement(&mut self, w: WorkerId) {
+        self.retire.remove(&w);
     }
 
     /// Next work for free worker `w`. `after` is the end of the segment it just finished, if any.

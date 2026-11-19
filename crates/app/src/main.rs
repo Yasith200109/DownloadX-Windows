@@ -94,7 +94,7 @@ mod xdgicons;
 /// `StartupWMClass=` names it (tools/installer/build-linux.sh, in the AppImage and the packages),
 /// so a window pinned to the taskbar or the dock is the launcher's, whatever name an AppImage
 /// manager gave the entry (#940). Also the entry's own name and the program's.
-pub const APP_ID: &str = "misterdownloadmanager";
+pub const APP_ID: &str = "downloadx";
 
 /// A new window's builder: every window of ours starts from it, so each carries [`APP_ID`]
 /// (eframe gives the main window its app name, a dialog nothing). Without it a dialog had no
@@ -106,7 +106,7 @@ pub fn window_builder() -> egui::ViewportBuilder {
 }
 
 /// The main window's title (dialogs find their owner by it).
-pub const MAIN_TITLE: &str = concat!("Mister Download Manager ", env!("CARGO_PKG_VERSION"));
+pub const MAIN_TITLE: &str = concat!("DownloadX ", env!("CARGO_PKG_VERSION"));
 
 /// The app icon (art/, made with ChatGPT; sizes by tools/icon/build_icon.py), for windows that
 /// show one as IDM's do: the 256 px size, which the system scales down for the title bar, the
@@ -345,7 +345,7 @@ fn main() -> std::process::ExitCode {
     // not. Linux and macOS have no such switch, only their own fixed limits (naming::Limits).
     #[cfg(windows)]
     mdm_engine::naming::set_long_paths(win32::long_paths_enabled());
-    // misterdownloadmanager-cli's commands (crates/cli): its launcher starts this program for
+    // downloadx-cli's commands (crates/cli): its launcher starts this program for
     // them. Nothing of the app's runs: no window, instance, crash monitor or crash log.
     if let Some(cli) = mdm_cli::launched(std::env::args_os().collect()) {
         // The default browser's User-Agent (#668): a command's download starts at once, so it
@@ -485,11 +485,7 @@ fn app() -> eframe::Result {
     // The log (release builds too) and the crash monitor.
     if let Some(data) = mdm_ipc::data_dir() {
         mdm_crash::logs::init(&data, mdm_crash::logs::APP);
-        tracing::info!(
-            "Mister Download Manager {} ({}) starting",
-            help::VERSION,
-            help::COMMIT
-        );
+        tracing::info!("DownloadX {} ({}) starting", help::VERSION, help::COMMIT);
     }
     // The default browser, looked for once on a thread of its own (logged): its User-Agent is
     // the one links added by hand go with (#668).

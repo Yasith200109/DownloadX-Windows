@@ -12,7 +12,7 @@
 #ifndef AppVersion
   #define AppVersion "0.5.2"
 #endif
-#define AppName "Mister Download Manager"
+#define AppName "DownloadX"
 #define AppExe "misterdownloadmanager.exe"
 #define HostExe "misterdownloadmanager-nmhost.exe"
 #define Root "..\.."
@@ -31,11 +31,11 @@ AppId={{667DB4D8-32C2-4487-A0E5-5825BF29778C}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=Ahmed Nefzaoui
-AppPublisherURL=https://github.com/anefzaoui/misterdownloadmanager
-AppSupportURL=https://github.com/anefzaoui/misterdownloadmanager/issues
-AppUpdatesURL=https://github.com/anefzaoui/misterdownloadmanager/releases
-AppCopyright=Copyright (C) 2026 Ahmed Nefzaoui
+AppPublisher=DownloadX Project
+AppPublisherURL=https://github.com/Yasith200109/DownloadX-Windows
+AppSupportURL=https://github.com/Yasith200109/DownloadX-Windows/issues
+AppUpdatesURL=https://github.com/Yasith200109/DownloadX-Windows/releases
+AppCopyright=Copyright (C) 2026 DownloadX contributors; original work by Ahmed Nefzaoui
 DefaultDirName={autopf}\{#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -74,12 +74,12 @@ OutputBaseFilename=MisterDownloadManager-{#AppVersion}-setup-{#Arch}
 Compression=lzma2/ultra64
 SolidCompression=yes
 ChangesAssociations=yes
-; A running MDM is asked to quit by [Code] (it holds the mutex MisterDownloadManager.Running);
+; A running DownloadX process is asked to quit by [Code] (legacy mutex retained for upgrade compatibility);
 ; AppMutex isn't used because it would refuse to start before that. Restart Manager is the
 ; fallback for anything else holding the files (a browser running the host).
 CloseApplications=yes
 VersionInfoVersion={#AppVersion}
-VersionInfoCompany=Ahmed Nefzaoui
+VersionInfoCompany=DownloadX Project
 VersionInfoDescription={#AppName} setup
 VersionInfoProductName={#AppName}
 #ifdef Sign

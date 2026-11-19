@@ -1,6 +1,6 @@
 [package]
 name = "mdm-app"
-description = "Mister Download Manager, desktop app (egui)"
+description = "DownloadX, desktop download manager (egui)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

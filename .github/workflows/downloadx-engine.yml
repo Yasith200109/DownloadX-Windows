@@ -1,0 +1,53 @@
+name: DownloadX engine checks
+
+on:
+  push:
+    branches: [downloadx/development]
+    paths:
+      - "crates/engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/downloadx-engine.yml"
+  pull_request:
+    paths:
+      - "crates/engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/downloadx-engine.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downloadx-engine-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  engine-policy:
+    name: DownloadX engine test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-downloadx-engine-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-downloadx-engine-
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Complete engine unit tests
+        run: cargo test -p mdm-engine --lib

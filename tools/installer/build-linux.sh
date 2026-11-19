@@ -75,13 +75,13 @@ EOF
 cat > "$tree/usr/share/applications/misterdownloadmanager.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Mister Download Manager
+Name=DownloadX
 Comment=Download manager
 Exec=misterdownloadmanager %U
 Icon=misterdownloadmanager
 Terminal=false
 Categories=Network;FileTransfer;
-StartupWMClass=misterdownloadmanager
+StartupWMClass=downloadx
 MimeType=x-scheme-handler/magnet;application/x-bittorrent;
 EOF
 
@@ -115,11 +115,11 @@ cat > "$deb/DEBIAN/control" <<EOF
 Package: misterdownloadmanager
 Version: $version
 Architecture: $deb_arch
-Maintainer: Mister Download Manager <https://github.com/anefzaoui/misterdownloadmanager>
+Maintainer: DownloadX Project <https://github.com/Yasith200109/DownloadX-Windows>
 Depends: libc6 (>= $glibc), libgtk-3-0, libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, ca-certificates
 Section: net
 Priority: optional
-Homepage: https://github.com/anefzaoui/misterdownloadmanager
+Homepage: https://github.com/Yasith200109/DownloadX-Windows
 Description: Download manager
  Speeds up downloads with several connections at once, resumes them, catches them from the
  browser, and downloads videos and torrents.

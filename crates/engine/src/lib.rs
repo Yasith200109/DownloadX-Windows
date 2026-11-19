@@ -20,6 +20,7 @@ pub mod sites;
 #[doc(hidden)]
 pub mod slowdisk;
 mod sparse;
+pub mod speed;
 pub mod state;
 pub mod tls;
 pub mod unlock;
@@ -35,5 +36,6 @@ pub use html::{DeclaredVideo, DeclaredVideos};
 pub use net::{NetError, Route};
 pub use server::Server;
 pub use sites::Refusal;
+pub use speed::{SpeedController, SpeedMode, SpeedObservation};
 pub use tls::CertProblem;
 pub use unlock::{ServiceFault, Unlocked, Unlocker};

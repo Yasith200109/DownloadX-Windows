@@ -101,7 +101,21 @@ jobs:
         if: runner.os == 'Windows' && runner.arch != 'ARM64'
         shell: pwsh
         run: |
-          choco install nasm --version 2.16.3 --no-progress -y
+          $ErrorActionPreference = "Stop"
+          $nasm = "C:\Program Files\NASM\nasm.exe"
+          if (-not (Test-Path $nasm)) {
+            $installed = $false
+            foreach ($delay in @(0, 15, 30)) {
+              if ($delay -gt 0) { Start-Sleep -Seconds $delay }
+              choco install nasm --version 2.16.3 --no-progress -y
+              if (Test-Path $nasm) {
+                $installed = $true
+                break
+              }
+            }
+            if (-not $installed) { throw "NASM 2.16.3 could not be installed after retries" }
+          }
+          & $nasm -v
           "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
       # Windows on ARM: LLVM (clang and libclang) for BoringSSL's and AWS-LC's assembly and

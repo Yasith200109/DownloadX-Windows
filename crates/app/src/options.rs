@@ -357,7 +357,7 @@ impl OptionsDialog {
         let outcome = window(
             ctx,
             "options",
-            "Mister Download Manager Configuration",
+            "DownloadX Settings",
             [430.0, 506.0],
             false,
             LIGHT_BG(),

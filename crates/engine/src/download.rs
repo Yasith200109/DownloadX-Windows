@@ -8,7 +8,7 @@
 //! reused between segments, TLS sessions resumed) with at most `connections()` requests at a
 //! time, since each worker has one request in flight.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,7 @@ use crate::net;
 use crate::planner::{Claim, Planner, WorkerId};
 use crate::sites::{self, PageSays, Refusal};
 use crate::sparse;
+use crate::speed::{SpeedController, SpeedMode, SpeedObservation};
 use crate::state::{ResumeState, Validators, state_path};
 
 /// Bytes buffered per connection before claiming and writing them. Each batch is one buffer of
@@ -1401,6 +1402,7 @@ impl Download {
                 finishing: None,
             }),
             seen: Default::default(),
+            request_metrics: Default::default(),
             planner: Mutex::new(None),
             limiter: Limiter::new(None),
             best_speed: Default::default(),
@@ -1511,8 +1513,107 @@ pub async fn fetch(
     dl.wait().await
 }
 
+#[derive(Default)]
+struct RequestMetrics {
+    /// Recent response latencies, bounded so concurrent downloads cannot grow this unbounded.
+    rtt_ms: VecDeque<u64>,
+    errors: u32,
+    throttled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RequestWindow {
+    median_rtt_ms: u64,
+    errors: u32,
+    throttled: bool,
+}
+
+impl RequestMetrics {
+    fn record(&mut self, elapsed: Duration, status: Option<StatusCode>, transport_error: bool) {
+        if status.is_some() {
+            if self.rtt_ms.len() == 31 {
+                self.rtt_ms.pop_front();
+            }
+            self.rtt_ms
+                .push_back(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+        }
+        let throttled = status.is_some_and(|s| {
+            s == StatusCode::TOO_MANY_REQUESTS || s == StatusCode::SERVICE_UNAVAILABLE
+        });
+        let retryable_status =
+            status.is_some_and(|s| s.is_server_error() || s == StatusCode::REQUEST_TIMEOUT);
+        if transport_error || throttled || retryable_status {
+            self.errors = self.errors.saturating_add(1);
+        }
+        self.throttled |= throttled;
+    }
+
+    fn take_window(&mut self) -> RequestWindow {
+        let mut samples: Vec<_> = self.rtt_ms.drain(..).collect();
+        samples.sort_unstable();
+        let median_rtt_ms = samples.get(samples.len() / 2).copied().unwrap_or(0);
+        RequestWindow {
+            median_rtt_ms,
+            errors: std::mem::take(&mut self.errors),
+            throttled: std::mem::take(&mut self.throttled),
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn latency_samples_are_bounded_and_use_the_median() {
+        let mut metrics = RequestMetrics::default();
+        for millis in 1..=40 {
+            metrics.record(Duration::from_millis(millis), Some(StatusCode::OK), false);
+        }
+        assert_eq!(metrics.rtt_ms.len(), 31);
+        assert_eq!(metrics.take_window().median_rtt_ms, 25);
+        assert_eq!(metrics.take_window(), RequestWindow::default());
+    }
+
+    #[test]
+    fn throttling_server_errors_and_transport_failures_are_counted() {
+        let mut metrics = RequestMetrics::default();
+        metrics.record(
+            Duration::from_millis(10),
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            false,
+        );
+        metrics.record(
+            Duration::from_millis(20),
+            Some(StatusCode::INTERNAL_SERVER_ERROR),
+            false,
+        );
+        metrics.record(Duration::from_millis(30), None, true);
+
+        let window = metrics.take_window();
+        assert_eq!(window.errors, 3);
+        assert!(window.throttled);
+        assert_eq!(window.median_rtt_ms, 20);
+        assert_eq!(metrics.take_window(), RequestWindow::default());
+    }
+
+    #[test]
+    fn request_timeout_is_counted_without_marking_the_server_throttled() {
+        let mut metrics = RequestMetrics::default();
+        metrics.record(
+            Duration::from_millis(50),
+            Some(StatusCode::REQUEST_TIMEOUT),
+            false,
+        );
+        let window = metrics.take_window();
+        assert_eq!(window.errors, 1);
+        assert!(!window.throttled);
+    }
+}
+
 struct Shared {
     view: Mutex<Snapshot>,
+    request_metrics: Mutex<RequestMetrics>,
     /// What the download's client learnt of its server (#140); the look's when it went on
     /// from the look's answer.
     seen: std::sync::OnceLock<Arc<crate::server::ServerSeen>>,
@@ -1617,6 +1718,19 @@ impl Shared {
             }
         };
         f(&mut v.connections[i]);
+    }
+
+    /// Record one request outcome. Only a small rolling set of response latencies is kept.
+    fn note_request(&self, elapsed: Duration, status: Option<StatusCode>, transport_error: bool) {
+        self.request_metrics
+            .lock()
+            .unwrap()
+            .record(elapsed, status, transport_error);
+    }
+
+    /// Take and reset the completed request-observation window.
+    fn take_request_window(&self) -> RequestWindow {
+        self.request_metrics.lock().unwrap().take_window()
     }
 
     fn with_planner<T>(&self, f: impl FnOnce(&mut Planner) -> T) -> T {
@@ -4059,14 +4173,17 @@ where
 /// Run connections until the planner is complete. Respawns a connection when work is left
 /// and none is running (e.g. the others retired).
 async fn supervise(ctx: Arc<Ctx>, first: Option<Body>) -> Result<(), Error> {
-    let mut set = JoinSet::new();
+    let mut set: JoinSet<(WorkerId, Result<(), Error>)> = JoinSet::new();
+    let mut live = HashSet::new();
     let mut next_id: WorkerId = 0;
     let probing = first.is_some();
     if let Some(body) = first {
         // The probe's body is byte 0 onward: reserve that segment for connection 0 before any
         // other connection can split or take it.
         ctx.shared.with_planner(|p| p.assign(0, None));
-        set.spawn(worker(ctx.clone(), 0, Some(body)));
+        let task_ctx = ctx.clone();
+        set.spawn(async move { (0, worker(task_ctx, 0, Some(body)).await) });
+        live.insert(0);
         next_id = 1;
     }
     // No more connections than the host is known to allow.
@@ -4097,16 +4214,27 @@ async fn supervise(ctx: Arc<Ctx>, first: Option<Body>) -> Result<(), Error> {
         1
     };
     while next_id < if held { scouts.min(max) } else { max } {
-        set.spawn(worker(ctx.clone(), next_id, None));
+        let id = next_id;
         next_id += 1;
+        let task_ctx = ctx.clone();
+        set.spawn(async move { (id, worker(task_ctx, id, None).await) });
+        live.insert(id);
     }
+
     let mut last_err = None;
+    let mut desired = max;
+    let mut controller = SpeedController::new(SpeedMode::Auto);
+    let mut last_sample_at = std::time::Instant::now();
+    let mut last_received = ctx.shared.received.load(Ordering::Relaxed);
+    let mut sample_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(3),
+        Duration::from_secs(3),
+    );
+    sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         let joined = tokio::select! {
-            joined = set.join_next() => match joined {
-                Some(joined) => joined,
-                None => break,
-            },
+            joined = set.join_next() => joined,
             () = ctx.range_answered.notified(), if held => {
                 held = false;
                 if ctx.browser.is_some() && next_id < max {
@@ -4115,13 +4243,91 @@ async fn supervise(ctx: Arc<Ctx>, first: Option<Body>) -> Result<(), Error> {
                     ));
                 }
                 while next_id < max {
-                    set.spawn(worker(ctx.clone(), next_id, None));
+                    let id = next_id;
                     next_id += 1;
+                    let task_ctx = ctx.clone();
+                    set.spawn(async move { (id, worker(task_ctx, id, None).await) });
+                    live.insert(id);
+                }
+                continue;
+            }
+            _ = sample_tick.tick(), if !held => {
+                // Unknown range support is not the same as a server refusing ranges. Keep the
+                // existing probe/scout behaviour until a valid 206 confirms parallel ranges.
+                if ctx.ranges.load(Ordering::SeqCst) == RANGES_YES {
+                    let now = std::time::Instant::now();
+                    let elapsed = now.saturating_duration_since(last_sample_at);
+                    // Count network bytes at receive time, not snapshot.downloaded: the latter
+                    // briefly moves between held-buffer and committed-disk counters.
+                    let total_received = ctx.shared.received.load(Ordering::Relaxed);
+                    let received = total_received.saturating_sub(last_received);
+                    let window = ctx.shared.take_request_window();
+                    let disk_backpressure = ctx
+                        .shared
+                        .disk_held
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|at| at.elapsed() < LINK_WINDOW);
+                    let limiter_active = ctx.shared.limiter.get().is_some()
+                        || ctx.opts.global.as_ref().is_some_and(|g| g.get().is_some());
+                    let current_host_limit =
+                        ctx.opts.host_limits.as_ref().and_then(|h| h.cap(&host));
+                    let current_max = current_host_limit
+                        .map_or(wanted, |cap| wanted.min(cap))
+                        .min(by_size.max(1))
+                        .max(1);
+                    let observation = SpeedObservation {
+                        active_connections: live.len() as u32,
+                        configured_max: current_max,
+                        host_limit: current_host_limit,
+                        ranges_supported: true,
+                        throughput_bps: rate(received, elapsed),
+                        rtt_ms: window.median_rtt_ms,
+                        request_errors: window.errors,
+                        throttled: window.throttled,
+                        disk_backpressure,
+                        limiter_active,
+                    };
+                    let target = controller.observe(observation).clamp(1, current_max);
+                    desired = target;
+
+                    let mut candidates: Vec<_> =
+                        live.iter().copied().filter(|id| *id != 0).collect();
+                    candidates.sort_unstable_by(|a, b| b.cmp(a));
+                    let retire_count = live.len().saturating_sub(target as usize);
+                    ctx.shared.with_planner(|p| {
+                        // Replace the previous window's retirement decisions atomically. A
+                        // recovered target must be able to cancel requests not yet consumed.
+                        for id in &live {
+                            p.cancel_retirement(*id);
+                        }
+                        for id in candidates.into_iter().take(retire_count) {
+                            p.request_retirement(id);
+                        }
+                    });
+                    while live.len() < target as usize {
+                        let id = next_id;
+                        next_id += 1;
+                        let task_ctx = ctx.clone();
+                        set.spawn(async move { (id, worker(task_ctx, id, None).await) });
+                        live.insert(id);
+                    }
+                    last_sample_at = now;
+                    last_received = total_received;
                 }
                 continue;
             }
         };
-        match joined.expect("worker panicked") {
+
+        let Some(joined) = joined else {
+            break;
+        };
+        let (id, result) = joined.expect("worker panicked");
+        live.remove(&id);
+        // A worker may have consumed its retirement request just before its JoinSet result is
+        // observed; clear any stale request before dropping its live-task entry.
+        ctx.shared.with_planner(|p| p.cancel_retirement(id));
+        match result {
             Err(e) if e.is_fatal() => {
                 stop_connections(&ctx, &mut set).await;
                 return Err(e);
@@ -4141,8 +4347,16 @@ async fn supervise(ctx: Arc<Ctx>, first: Option<Body>) -> Result<(), Error> {
             if let Some(e) = last_err.take() {
                 return Err(e); // the last connection exhausted its retries
             }
-            set.spawn(worker(ctx.clone(), next_id, None));
-            next_id += 1;
+            // All workers may have retired after finishing their segments. Recreate only the
+            // current target, with fresh monotonically increasing IDs.
+            let count = desired.max(1).min(max);
+            while live.len() < count as usize {
+                let id = next_id;
+                next_id += 1;
+                let task_ctx = ctx.clone();
+                set.spawn(async move { (id, worker(task_ctx, id, None).await) });
+                live.insert(id);
+            }
         }
     }
     Ok(())
@@ -4155,7 +4369,7 @@ async fn supervise(ctx: Arc<Ctx>, first: Option<Body>) -> Result<(), Error> {
 /// still taken (#201: a connection taken over in its overlap check, on a busy machine), and a
 /// stopped one went on writing after it had returned. Every wait of a connection ends on its
 /// token, and a blocking call only takes as long as one read or write.
-async fn stop_connections(ctx: &Ctx, set: &mut JoinSet<Result<(), Error>>) {
+async fn stop_connections(ctx: &Ctx, set: &mut JoinSet<(WorkerId, Result<(), Error>)>) {
     ctx.cancel.cancel();
     while set.join_next().await.is_some() {}
 }
@@ -4169,6 +4383,12 @@ async fn worker(ctx: Arc<Ctx>, id: WorkerId, mut first: Option<Body>) -> Result<
     loop {
         if ctx.cancel.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+        // Retirement is observed only between assignments. A worker that is currently
+        // receiving data must finish its segment and let the writer commit it before leaving.
+        if ctx.shared.with_planner(|p| p.take_retirement(id)) {
+            ctx.shared.conn(id, ConnView::finish);
+            return Ok(());
         }
         let Some(a) = ctx.shared.with_planner(|p| p.assign(id, after.take())) else {
             ctx.shared.conn(id, ConnView::finish);
@@ -4418,7 +4638,8 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
         .if_range(target.url.host_str())
         .and_then(|v| HeaderValue::from_str(v).ok());
     let range = format!("bytes={from}-{}", to - 1);
-    let (head, body) = match &ctx.browser {
+    let request_started = std::time::Instant::now();
+    let response = match &ctx.browser {
         // The browser-like connection's own (#668): its redirects followed as `get` does.
         Some(b) => {
             let mut headers = target.headers.clone();
@@ -4426,10 +4647,9 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
             if let Some(v) = &if_range {
                 headers.insert(header::IF_RANGE, v.clone());
             }
-            let (head, body, _) = b
-                .get(target.url.clone(), headers, true, &ctx.cancel)
-                .await?;
-            (head, body)
+            b.get(target.url.clone(), headers, true, &ctx.cancel)
+                .await
+                .map(|(head, body, _)| (head, body))
         }
         None => {
             let mut req = build(
@@ -4443,8 +4663,23 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
             if let Some(v) = &if_range {
                 req = req.header(header::IF_RANGE, v);
             }
-            let resp = cancellable(&ctx.cancel, async { Ok(req.send().await?) }).await?;
-            (Head::of(&resp), Body::Http(resp))
+            match cancellable(&ctx.cancel, async { Ok(req.send().await?) }).await {
+                Ok(resp) => Ok((Head::of(&resp), Body::Http(resp))),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    let (head, body) = match response {
+        Ok((head, body)) => {
+            ctx.shared
+                .note_request(request_started.elapsed(), Some(head.status), false);
+            (head, body)
+        }
+        Err(e) => {
+            let cancelled = matches!(&e, Error::Cancelled);
+            ctx.shared
+                .note_request(request_started.elapsed(), None, !cancelled);
+            return Err(e);
         }
     };
     // A resumed download asks nothing before its connections: the first one's answer is the

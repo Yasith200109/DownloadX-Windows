@@ -170,6 +170,59 @@ fn split_shortens_the_owner_who_then_finishes_early() {
 }
 
 #[test]
+fn retirement_waits_until_the_current_segment_is_committed() {
+    let mut p = Planner::new(8 * MB, MB);
+    p.assign(3, None).unwrap();
+    p.request_retirement(3);
+
+    assert!(
+        !p.take_retirement(3),
+        "an active segment must never be abandoned"
+    );
+    assert_eq!(p.claim(3, 0, 2 * MB), Claim::Granted(2 * MB));
+    assert_eq!(p.commit(3, 2 * MB), None);
+    assert!(
+        !p.take_retirement(3),
+        "partially committed segment is still owned"
+    );
+
+    assert_eq!(p.claim(3, 2 * MB, 6 * MB), Claim::Granted(6 * MB));
+    assert_eq!(p.commit(3, 8 * MB), Some(8 * MB));
+    assert!(
+        p.take_retirement(3),
+        "completed segment releases the worker"
+    );
+    assert!(!p.take_retirement(3), "retirement request is consumed once");
+    assert!(p.is_complete());
+    check_invariants(&p);
+}
+
+#[test]
+fn a_recovered_target_can_cancel_a_pending_retirement() {
+    let mut p = Planner::new(8 * MB, MB);
+    p.assign(6, None).unwrap();
+    p.request_retirement(6);
+    p.cancel_retirement(6);
+    assert!(!p.take_retirement(6));
+    assert!(p.holds(6), "the worker keeps its current segment");
+    check_invariants(&p);
+}
+
+#[test]
+fn retirement_can_be_consumed_after_a_worker_releases_a_failed_segment() {
+    let mut p = Planner::new(8 * MB, MB);
+    p.assign(4, None).unwrap();
+    p.request_retirement(4);
+    assert!(!p.take_retirement(4));
+    p.claim(4, 0, MB);
+    p.commit(4, MB);
+    p.release(4);
+    assert!(p.take_retirement(4));
+    assert_eq!(p.assign(5, None).unwrap().from, MB);
+    check_invariants(&p);
+}
+
+#[test]
 fn release_drops_uncommitted_claims() {
     let mut p = Planner::new(4 * MB, MB);
     p.assign(0, None).unwrap();
